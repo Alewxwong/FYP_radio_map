@@ -1,0 +1,15 @@
+conda activate fyp_radio_map
+
+数据集划分策略：按 Map ID (0 到 699) 划分。
+Training Set: Map 0 ~ 559 (560 个 maps × 80 Tx = 44,800 样本)
+Validation Set: Map 560 ~ 629 (70 个 maps × 80 Tx = 5,600 样本)
+Test Set: Map 630 ~ 699 (70 个 maps × 80 Tx = 5,600 样本)
+数据输入结构：你的模型输入是一个 5 通道的张量 (5, 256, 256)：
+Channel 1: Building Mask (从 buildings_complete 读取)
+Channel 2: Antenna Heatmap (从 antennas 读取或根据 JSON 生成)
+Channel 3: SDF (Signed Distance Field，由 Building Mask 计算)
+Channel 4: Tx Distance Map (由 Antenna 位置计算)
+Channel 5: LoS/Shadow Mask (由 Building 和 Antenna 计算)
+Target (Label): IRT4 Gain Map (从 gain/IRT4 读取)
+
+[1] Ç. Yapar, R. Levie, G. Kutyniok, G. Caire,"Dataset of pathloss and ToA radio maps with localization application" arXiv preprint:2212.11777, Nov. 2022.

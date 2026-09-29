@@ -1,0 +1,16 @@
+# Ignore large datasets and model checkpoints
+dataset/
+checkpoints/
+*.h5
+*.pth
+*.pt
+
+# Ignore Python cache and virtual environments
+__pycache__/
+*.pyc
+.venv/
+env/
+
+# Ignore OS files
+Thumbs.db
+.DS_Store
