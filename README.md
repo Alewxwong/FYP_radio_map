@@ -1,7 +1,3 @@
-Here is a complete, professional, and detailed `README.md` file tailored for your Final Year Project. You can copy and paste this directly into your GitHub repository. It clearly explains your methodology, dataset, architecture, and how to run your code.
-
-***
-
 #  Real-Time 2D Radio Environment Mapping using Physics-Unrolled Neural Operators
 
 **Final Year Project (FYP)**  
