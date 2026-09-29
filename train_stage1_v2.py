@@ -134,7 +134,6 @@ class SobolevLoss(nn.Module):
         return F.mse_loss(pred_grad_x, target_grad_x) + F.mse_loss(pred_grad_y, target_grad_y)
 
 def compute_metrics(preds, targets, threshold=0.2):
-    """Returns metrics in both Normalized (0-1) and Original (0-255) scales."""
     # Normalized Scale
     rmse_norm = torch.sqrt(torch.mean((preds - targets) ** 2)).item()
     mae_norm = torch.mean(torch.abs(preds - targets)).item()
@@ -149,9 +148,13 @@ def compute_metrics(preds, targets, threshold=0.2):
     TP = torch.sum(pred_outage * target_outage) 
     FN = torch.sum((1 - pred_outage) * target_outage) 
     FP = torch.sum(pred_outage * (1 - target_outage)) 
+    
+    # .item() is called here, so recall and precision are now standard Python floats
     recall = (TP / (TP + FN + 1e-8)).item()
     precision = (TP / (TP + FP + 1e-8)).item()
-    f1 = (2 * (precision * recall) / (precision + recall + 1e-8)).item()
+    
+    # Calculate F1 using the float values directly. DO NOT use .item() here!
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
     
     return rmse_norm, rmse_orig, mae_orig, recall, f1
 
