@@ -161,15 +161,6 @@ Unlike standard computer vision tasks, radio map accuracy must be evaluated base
 
 ---
 
-## ⚠️ Important Notes
-
-*   **Storage:** The `.h5` dataset files are large (several GBs). Ensure they are added to your `.gitignore` so they are not accidentally pushed to GitHub.
-*   **Hardware:** If you encounter `CUDA Out of Memory` errors during training, reduce the `BATCH_SIZE` to `2` or `HIDDEN_CHANNELS` to `16` in the training scripts.
-*   **Outage Threshold:** The `OUTAGE_THRESHOLD` in the code is set to `0.2` (normalized 0-1 scale). Adjust this if your data normalization pipeline changes.
-*   **Local Paths:** Ensure your paths in the `CONFIGURATION` section of the Python scripts match your local directory structure if they differ from the default `C:\Users\user\Desktop\Fgo\...`.
-
----
-
 ## 📚 8. References & Literature
 
 This project builds upon and adapts the following state-of-the-art research:
