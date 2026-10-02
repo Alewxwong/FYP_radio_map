@@ -13,17 +13,20 @@ OUTPUT_DIR = r"C:\Users\user\Desktop\Fgo\dataset\checkpoints"
 TEST_FILE = os.path.join(DATA_DIR, 'radiomapseer_multifidelity_test.h5')
 CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, 'stage2_combined_best.pth')
 
-# Model Hyperparameters (Must match training)
 INPUT_CHANNELS = 5  
 HIDDEN_CHANNELS = 32 
 FNO_MODES = 16       
-OUTPUT_CHANNELS = 1  
+
+# Metric Conversion (Matches your training logs)
+DB_RANGE = 139.0 
+PIXEL_MAX = 255.0
+DB_FACTOR = DB_RANGE / PIXEL_MAX  # ~0.545 dB per pixel
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # ==========================================
-# 2. MODEL ARCHITECTURES
+# 2. MODEL ARCHITECTURES (Must match training exactly)
 # ==========================================
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes1, modes2):
@@ -89,7 +92,8 @@ class Stage1Model(nn.Module):
         x = self.decoder(x)
         return x
 
-class Stage2Refinement(nn.Module):
+# --- Upgraded Stage 2: Diffraction-Aware Refinement ---
+class DiffractionRefinement(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels=1):
         super().__init__()
         self.encoder = nn.Sequential(
@@ -97,6 +101,18 @@ class Stage2Refinement(nn.Module):
             nn.ReLU(),
             nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
             nn.ReLU()
+        )
+        self.dilated_block = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=2, dilation=2),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=4, dilation=4),
+            nn.ReLU()
+        )
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 1, 3, padding=1),
+            nn.Sigmoid()
         )
         self.decoder = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels // 2, 3, padding=1),
@@ -107,6 +123,13 @@ class Stage2Refinement(nn.Module):
     def forward(self, stage1_output, geometry_priors):
         x = torch.cat([stage1_output, geometry_priors], dim=1)
         x = self.encoder(x)
+        x = self.dilated_block(x)
+        
+        # SDF is channel index 2 in geometry_priors (Building=0, Antenna=1, SDF=2, LoS=3)
+        sdf = geometry_priors[:, 2:3, :, :]
+        edge_gate = self.gate_conv(sdf)
+        
+        x = x * edge_gate
         residual = self.decoder(x)
         return residual
 
@@ -116,25 +139,25 @@ class Stage2Refinement(nn.Module):
 def run_inference():
     print("Loading Test Data...")
     with h5py.File(TEST_FILE, 'r') as f:
-        # Load 4 random samples from the test set for visualization
         num_samples = f['inputs'].shape[0]
         indices = np.random.choice(num_samples, 4, replace=False)
+        
+        # FIX 1: Sort indices to prevent h5py "Indexing elements must be in increasing order" error
         indices = np.sort(indices) 
+        
         inputs = torch.tensor(f['inputs'][indices], dtype=torch.float32)
-        # Targets are normalized to 0-1 scale during training
-        targets = torch.tensor(f['irt2_targets'][indices] / 255.0, dtype=torch.float32) 
+        targets = torch.tensor(f['irt2_targets'][indices] / 255.0, dtype=torch.float32) # Normalized 0-1
 
     print("Loading Models...")
-    # Initialize models
-    stage1_model = Stage1Model(INPUT_CHANNELS, HIDDEN_CHANNELS, FNO_MODES, OUTPUT_CHANNELS).to(device)
-    stage2_model = Stage2Refinement(in_channels=5, hidden_channels=HIDDEN_CHANNELS, out_channels=OUTPUT_CHANNELS).to(device)
+    stage1_model = Stage1Model(INPUT_CHANNELS, HIDDEN_CHANNELS, FNO_MODES, 1).to(device)
+    stage2_model = DiffractionRefinement(in_channels=5, hidden_channels=HIDDEN_CHANNELS, out_channels=1).to(device)
 
-    # Load weights
     if os.path.exists(CHECKPOINT_PATH):
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+        # FIX 2: weights_only=False suppresses the PyTorch security warning
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
         stage1_model.load_state_dict(checkpoint['stage1_state_dict'])
         stage2_model.load_state_dict(checkpoint['stage2_state_dict'])
-        print(f"Successfully loaded weights from {CHECKPOINT_PATH}")
+        print("Successfully loaded Stage 1 and Stage 2 weights.")
     else:
         print(f"ERROR: Checkpoint not found at {CHECKPOINT_PATH}")
         return
@@ -146,101 +169,104 @@ def run_inference():
     with torch.no_grad():
         inputs = inputs.to(device)
         targets = targets.to(device)
-
-        # Stage 1 Prediction
+        
         stage1_pred = stage1_model(inputs)
-
-        # Stage 2 Prediction (Residual)
-        geometry_priors = inputs[:, 0:4, :, :] # Building, Antenna, SDF, LoS
+        geometry_priors = inputs[:, 0:4, :, :]
         residual = stage2_model(stage1_pred, geometry_priors)
-
-        # Final Prediction
         final_pred = stage1_pred + residual
 
-    # Move back to CPU for plotting and metric calculation
+    # Move back to CPU for metric calculation and plotting
     inputs = inputs.cpu().numpy()
     targets = targets.cpu().numpy()
     stage1_pred = stage1_pred.cpu().numpy()
     final_pred = final_pred.cpu().numpy()
 
-    # Calculate overall metrics for the 4 samples
-    errors = final_pred - targets
-    mse_norm = np.mean(errors ** 2)
-    rmse_norm = np.sqrt(mse_norm)
-    mae_norm = np.mean(np.abs(errors))
+    # ==========================================
+    # Calculate Metrics (in dB to match training logs)
+    # ==========================================
+    rmse_norm = np.sqrt(np.mean((final_pred - targets) ** 2))
+    mae_norm = np.mean(np.abs(final_pred - targets))
     
-    # Convert back to original 0-255 scale for intuitive interpretation
-    mse_orig = mse_norm * (255 ** 2)
-    rmse_orig = rmse_norm * 255
-    mae_orig = mae_norm * 255
+    # Convert to dB
+    rmse_db = rmse_norm * PIXEL_MAX * DB_FACTOR
+    mae_db = mae_norm * PIXEL_MAX * DB_FACTOR
+    
+    # Outage Metrics (Threshold = 0.2 normalized)
+    outage_threshold = 0.2
+    pred_outage = (final_pred < outage_threshold).astype(float)
+    target_outage = (targets < outage_threshold).astype(float)
+    
+    TP = np.sum(pred_outage * target_outage)
+    FN = np.sum((1 - pred_outage) * target_outage)
+    FP = np.sum(pred_outage * (1 - target_outage))
+    
+    recall = TP / (TP + FN + 1e-8)
+    precision = TP / (TP + FP + 1e-8)
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
 
-    print(f"\n{'='*50}")
-    print(f"Overall Metrics for 4 Visualized Samples:")
-    print(f"{'='*50}")
+    print("\n" + "="*60)
+    print("OVERALL TEST SET METRICS (4 Random Samples)")
+    print("="*60)
     print(f"Normalized Scale (0.0 to 1.0):")
-    print(f"  MSE : {mse_norm:.6f}")
-    print(f"  RMSE: {rmse_norm:.6f}")
-    print(f"  MAE : {mae_norm:.6f}")
-    print(f"Original Scale (0 to 255):")
-    print(f"  MSE : {mse_orig:.2f}")
-    print(f"  RMSE: {rmse_orig:.2f}")
-    print(f"  MAE : {mae_orig:.2f}")
-    print(f"{'='*50}\n")
+    print(f"  RMSE: {rmse_norm:.4f}")
+    print(f"  MAE : {mae_norm:.4f}")
+    print(f"Decibel Scale (dB) - Matches Training Logs:")
+    print(f"  RMSE: {rmse_db:.2f} dB")
+    print(f"  MAE : {mae_db:.2f} dB")
+    print(f"Outage Detection (Threshold < 0.2):")
+    print(f"  Recall    : {recall:.3f}")
+    print(f"  Precision : {precision:.3f}")
+    print(f"  Outage F1 : {f1:.3f}")
+    print("="*60 + "\n")
 
     # ==========================================
-    # Plotting with Color Bars and Metrics
+    # Visualization
     # ==========================================
-    fig, axes = plt.subplots(4, 6, figsize=(24, 16))
+    fig, axes = plt.subplots(4, 7, figsize=(28, 16))
     plt.subplots_adjust(wspace=0.1, hspace=0.2)
 
-    # Define colormaps and limits
-    cmap_signal = 'jet'
-    cmap_error = 'hot'
-    vmin_signal, vmax_signal = 0.0, 1.0
-    vmin_error, vmax_error = 0.0, 0.2 # Adjust based on typical error magnitude
-
     for i in range(4):
-        # Calculate per-sample MSE and RMSE
-        sample_error = final_pred[i, 0] - targets[i, 0]
-        sample_mse = np.mean(sample_error ** 2)
-        sample_rmse = np.sqrt(sample_mse)
-        abs_error = np.abs(sample_error)
-
-        # 1. Ground Truth
-        im1 = axes[i, 0].imshow(targets[i, 0], cmap=cmap_signal, vmin=vmin_signal, vmax=vmax_signal)
-        axes[i, 0].set_title(f'Ground Truth\n(Sample {i+1})', fontsize=10)
+        # 1. Building Mask
+        axes[i, 0].imshow(inputs[i, 0], cmap='gray')
+        axes[i, 0].set_title(f'Sample {i+1}\nBuilding Mask', fontsize=10)
         axes[i, 0].axis('off')
-        fig.colorbar(im1, ax=axes[i, 0], fraction=0.046, pad=0.04)
 
-        # 2. Stage 1 Output
-        im2 = axes[i, 1].imshow(stage1_pred[i, 0], cmap=cmap_signal, vmin=vmin_signal, vmax=vmax_signal)
-        axes[i, 1].set_title('Stage 1 Output (FNO)', fontsize=10)
+        # 2. SDF
+        axes[i, 1].imshow(inputs[i, 2], cmap='viridis')
+        axes[i, 1].set_title('SDF', fontsize=10)
         axes[i, 1].axis('off')
-        fig.colorbar(im2, ax=axes[i, 1], fraction=0.046, pad=0.04)
 
-        # 3. Final Output (Stage 1 + Stage 2)
-        im3 = axes[i, 2].imshow(final_pred[i, 0], cmap=cmap_signal, vmin=vmin_signal, vmax=vmax_signal)
-        axes[i, 2].set_title('Final Output (Combined)', fontsize=10)
+        # 3. Ground Truth
+        im_gt = axes[i, 2].imshow(targets[i, 0], cmap='jet', vmin=0, vmax=1)
+        axes[i, 2].set_title('Ground Truth', fontsize=10)
         axes[i, 2].axis('off')
-        fig.colorbar(im3, ax=axes[i, 2], fraction=0.046, pad=0.04)
+        fig.colorbar(im_gt, ax=axes[i, 2], fraction=0.046, pad=0.04)
 
-        # 4. Absolute Error Map (with MSE/RMSE annotated in title)
-        im4 = axes[i, 3].imshow(abs_error, cmap=cmap_error, vmin=vmin_error, vmax=vmax_error)
-        axes[i, 3].set_title(f'Absolute Error Map\nMSE: {sample_mse:.4f} | RMSE: {sample_rmse:.4f}', fontsize=10)
+        # 4. Stage 1 Output
+        im_s1 = axes[i, 3].imshow(stage1_pred[i, 0], cmap='jet', vmin=0, vmax=1)
+        axes[i, 3].set_title('Stage 1 (FNO)', fontsize=10)
         axes[i, 3].axis('off')
-        fig.colorbar(im4, ax=axes[i, 3], fraction=0.046, pad=0.04)
+        fig.colorbar(im_s1, ax=axes[i, 3], fraction=0.046, pad=0.04)
 
-        # 5. Building Mask (Input Channel 0)
-        axes[i, 4].imshow(inputs[i, 0], cmap='gray')
-        axes[i, 4].set_title('Building Mask', fontsize=10)
+        # 5. Final Output (Stage 1 + Stage 2)
+        im_final = axes[i, 4].imshow(final_pred[i, 0], cmap='jet', vmin=0, vmax=1)
+        axes[i, 4].set_title('Final (FNO + GNO)', fontsize=10)
         axes[i, 4].axis('off')
+        fig.colorbar(im_final, ax=axes[i, 4], fraction=0.046, pad=0.04)
 
-        # 6. SDF (Input Channel 2)
-        axes[i, 5].imshow(inputs[i, 2], cmap='viridis')
-        axes[i, 5].set_title('SDF (Distance to Wall)', fontsize=10)
+        # 6. Absolute Error Map
+        error_map = np.abs(targets[i, 0] - final_pred[i, 0])
+        im_err = axes[i, 5].imshow(error_map, cmap='hot', vmin=0, vmax=0.2)
+        axes[i, 5].set_title('Absolute Error', fontsize=10)
         axes[i, 5].axis('off')
+        fig.colorbar(im_err, ax=axes[i, 5], fraction=0.046, pad=0.04)
+        
+        # 7. Error Map Zoom (Bottom Right Corner example)
+        axes[i, 6].imshow(error_map[180:256, 180:256], cmap='hot', vmin=0, vmax=0.2)
+        axes[i, 6].set_title('Error Zoom\n(Corner)', fontsize=10)
+        axes[i, 6].axis('off')
 
-    output_image_path = os.path.join(OUTPUT_DIR, 'inference_visualization_with_metrics.png')
+    output_image_path = os.path.join(OUTPUT_DIR, 'inference_visualization.png')
     plt.savefig(output_image_path, dpi=150, bbox_inches='tight')
     print(f"Visualization saved to: {output_image_path}")
     plt.show()
