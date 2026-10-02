@@ -1,7 +1,3 @@
-Here is the updated `README.md`, strictly following the exact format, structure, and emoji style of the file you provided, while integrating all our latest improvements (Diffraction-Aware Refinement, IRT4 Fine-Tuning, and dB metrics).
-
-***
-
 # Real-Time 2D Radio Environment Mapping using Physics-Unrolled Neural Operators
 
 **Final Year Project (FYP)**  
