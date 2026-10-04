@@ -1,275 +1,254 @@
 import os
 import h5py
-import torch
-import torch.nn as nn
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 
-# ==========================================
-# 1. CONFIGURATION
-# ==========================================
+from torch.utils.data import DataLoader, Subset
+
+from common import (
+    get_device,
+    RadioMapH5Dataset,
+    Stage1Model,
+    Stage2Model,
+    MetricAccumulator,
+)
+
+
+# ==========================================================
+# Configuration
+# ==========================================================
 DATA_DIR = r"C:\Users\user\Desktop\Fgo\dataset\processed_data"
 OUTPUT_DIR = r"C:\Users\user\Desktop\Fgo\dataset\checkpoints"
-TEST_FILE = os.path.join(DATA_DIR, 'radiomapseer_multifidelity_test.h5')
-CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, 'stage2_combined_best.pth')
 
-INPUT_CHANNELS = 5  
-HIDDEN_CHANNELS = 32 
-FNO_MODES = 16       
+TEST_H5 = os.path.join(DATA_DIR, "radiomapseer_multifidelity_test.h5")
+CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "stage2_combined_best.pth")
 
-# Metric Conversion (Matches your training logs)
-DB_RANGE = 139.0 
-PIXEL_MAX = 255.0
-DB_FACTOR = DB_RANGE / PIXEL_MAX  # ~0.545 dB per pixel
+VIS_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "inference_visualization.png")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+BATCH_SIZE = 4
+NUM_VIS_SAMPLES = 4
 
-# ==========================================
-# 2. MODEL ARCHITECTURES (Must match training exactly)
-# ==========================================
-class SpectralConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, modes1, modes2):
-        super(SpectralConv2d, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes1 = modes1
-        self.modes2 = modes2
-        self.scale = (1 / (in_channels * out_channels))
-        self.weights1 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
-        self.weights2 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+# Set to -1 to evaluate on the full test set.
+# Set to e.g. 500 if you want a quick test.
+MAX_TEST_SAMPLES = -1
 
-    def compl_mul2d(self, input, weights):
-        return torch.einsum("bixy,ioxy->boxy", input, weights)
+SEED = 42
 
-    def forward(self, x):
-        batchsize = x.shape[0]
-        x_ft = torch.fft.rfft2(x)
-        out_ft = torch.zeros(batchsize, self.out_channels, x.size(-2), x.size(-1)//2 + 1, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :self.modes1, :self.modes2] = self.compl_mul2d(x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
-        out_ft[:, :, -self.modes1:, :self.modes2] = self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
-        return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+# Fallback model config if checkpoint does not contain config.
+FALLBACK_STAGE1_BASE = 32
+FALLBACK_STAGE1_MODES = 16
+FALLBACK_STAGE2_BASE = 32
+FALLBACK_STAGE2_MODES = 16
 
-class FNOBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, modes):
-        super().__init__()
-        self.spectral = SpectralConv2d(in_channels, out_channels, modes, modes)
-        self.linear = nn.Conv2d(in_channels, out_channels, 1)
 
-    def forward(self, x):
-        return self.spectral(x) + self.linear(x)
+def load_models(device):
+    print(f"Loading checkpoint: {CHECKPOINT_PATH}")
 
-class LocalConvBranch(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        )
+    ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
 
-    def forward(self, x):
-        return self.conv(x)
+    cfg = ckpt.get("config", {})
 
-class Stage1Model(nn.Module):
-    def __init__(self, input_ch, hidden_ch, modes, output_ch):
-        super().__init__()
-        self.encoder = nn.Sequential(nn.Conv2d(input_ch, hidden_ch, 1), nn.ReLU())
-        self.fno1 = FNOBlock(hidden_ch, hidden_ch, modes)
-        self.fno2 = FNOBlock(hidden_ch, hidden_ch, modes)
-        self.local1 = LocalConvBranch(hidden_ch, hidden_ch)
-        self.local2 = LocalConvBranch(hidden_ch, hidden_ch)
-        self.decoder = nn.Sequential(
-            nn.Conv2d(hidden_ch, hidden_ch // 2, 1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_ch // 2, output_ch, 1)
-        )
+    stage1_base = cfg.get("stage1_base", FALLBACK_STAGE1_BASE)
+    stage1_modes = cfg.get("stage1_modes", FALLBACK_STAGE1_MODES)
+    stage2_base = cfg.get("stage2_base", FALLBACK_STAGE2_BASE)
+    stage2_modes = cfg.get("stage2_modes", FALLBACK_STAGE2_MODES)
+    input_ch = cfg.get("input_ch", 5)
 
-    def forward(self, x):
-        x = self.encoder(x)
-        x = x + self.fno1(x) + self.local1(x)
-        x = x + self.fno2(x) + self.local2(x)
-        x = self.decoder(x)
-        return x
+    stage1_model = Stage1Model(
+        input_ch=input_ch,
+        base=stage1_base,
+        fno_modes=stage1_modes,
+    ).to(device)
 
-# --- Upgraded Stage 2: Diffraction-Aware Refinement ---
-class DiffractionRefinement(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels=1):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
-            nn.ReLU()
-        )
-        self.dilated_block = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=2, dilation=2),
-            nn.ReLU(),
-            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=4, dilation=4),
-            nn.ReLU()
-        )
-        self.gate_conv = nn.Sequential(
-            nn.Conv2d(1, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 1, 3, padding=1),
-            nn.Sigmoid()
-        )
-        self.decoder = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels // 2, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_channels // 2, out_channels, 1)
-        )
+    stage2_model = Stage2Model(
+        input_ch=input_ch,
+        base=stage2_base,
+        fno_modes=stage2_modes,
+    ).to(device)
 
-    def forward(self, stage1_output, geometry_priors):
-        x = torch.cat([stage1_output, geometry_priors], dim=1)
-        x = self.encoder(x)
-        x = self.dilated_block(x)
-        
-        # SDF is channel index 2 in geometry_priors (Building=0, Antenna=1, SDF=2, LoS=3)
-        sdf = geometry_priors[:, 2:3, :, :]
-        edge_gate = self.gate_conv(sdf)
-        
-        x = x * edge_gate
-        residual = self.decoder(x)
-        return residual
-
-# ==========================================
-# 3. INFERENCE & VISUALIZATION
-# ==========================================
-def run_inference():
-    print("Loading Test Data...")
-    with h5py.File(TEST_FILE, 'r') as f:
-        num_samples = f['inputs'].shape[0]
-        indices = np.random.choice(num_samples, 4, replace=False)
-        
-        # FIX 1: Sort indices to prevent h5py "Indexing elements must be in increasing order" error
-        indices = np.sort(indices) 
-        
-        inputs = torch.tensor(f['inputs'][indices], dtype=torch.float32)
-        targets = torch.tensor(f['irt2_targets'][indices] / 255.0, dtype=torch.float32) # Normalized 0-1
-
-    print("Loading Models...")
-    stage1_model = Stage1Model(INPUT_CHANNELS, HIDDEN_CHANNELS, FNO_MODES, 1).to(device)
-    stage2_model = DiffractionRefinement(in_channels=5, hidden_channels=HIDDEN_CHANNELS, out_channels=1).to(device)
-
-    if os.path.exists(CHECKPOINT_PATH):
-        # FIX 2: weights_only=False suppresses the PyTorch security warning
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
-        stage1_model.load_state_dict(checkpoint['stage1_state_dict'])
-        stage2_model.load_state_dict(checkpoint['stage2_state_dict'])
-        print("Successfully loaded Stage 1 and Stage 2 weights.")
+    if "stage1_state_dict" in ckpt:
+        stage1_model.load_state_dict(ckpt["stage1_state_dict"])
     else:
-        print(f"ERROR: Checkpoint not found at {CHECKPOINT_PATH}")
-        return
+        raise KeyError("Checkpoint does not contain 'stage1_state_dict'.")
+
+    if "stage2_state_dict" in ckpt:
+        stage2_model.load_state_dict(ckpt["stage2_state_dict"])
+    else:
+        print("WARNING: checkpoint does not contain stage2_state_dict. Using Stage 1 only.")
+        stage2_model = None
 
     stage1_model.eval()
-    stage2_model.eval()
+    if stage2_model is not None:
+        stage2_model.eval()
 
-    print("Running Inference...")
+    return stage1_model, stage2_model
+
+
+def evaluate_test(stage1_model, stage2_model, device):
+    print("\nEvaluating on test set...")
+
+    test_ds = RadioMapH5Dataset(TEST_H5, augment=False)
+
+    if MAX_TEST_SAMPLES is not None and MAX_TEST_SAMPLES > 0 and MAX_TEST_SAMPLES < len(test_ds):
+        rng = np.random.RandomState(SEED)
+        indices = rng.choice(len(test_ds), size=MAX_TEST_SAMPLES, replace=False)
+        indices = np.sort(indices).tolist()
+        test_ds = Subset(test_ds, indices)
+        print(f"Evaluating on {len(test_ds)} randomly selected test samples.")
+    else:
+        print(f"Evaluating on all {len(test_ds)} test samples.")
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    metrics_stage1 = MetricAccumulator()
+    metrics_final = MetricAccumulator()
+
     with torch.no_grad():
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        
-        stage1_pred = stage1_model(inputs)
-        geometry_priors = inputs[:, 0:4, :, :]
-        residual = stage2_model(stage1_pred, geometry_priors)
-        final_pred = stage1_pred + residual
+        for inputs, targets in test_loader:
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-    # Move back to CPU for metric calculation and plotting
+            stage1_pred = stage1_model(inputs)
+
+            if stage2_model is not None:
+                final_pred = stage2_model(stage1_pred, inputs)
+            else:
+                final_pred = stage1_pred
+
+            metrics_stage1.update(stage1_pred, targets)
+            metrics_final.update(final_pred, targets)
+
+    stage1_out = metrics_stage1.compute()
+    final_out = metrics_final.compute()
+
+    return stage1_out, final_out
+
+
+def visualize(stage1_model, stage2_model, device):
+    print("\nGenerating visualization...")
+
+    with h5py.File(TEST_H5, "r") as f:
+        num_samples = f["inputs"].shape[0]
+        n = min(NUM_VIS_SAMPLES, num_samples)
+
+        rng = np.random.RandomState(SEED + 1)
+        indices = rng.choice(num_samples, size=n, replace=False)
+        indices = np.sort(indices)
+
+        inputs = torch.tensor(f["inputs"][indices], dtype=torch.float32)
+        targets = torch.tensor(f["irt2_targets"][indices] / 255.0, dtype=torch.float32)
+
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+
+    with torch.no_grad():
+        stage1_pred = stage1_model(inputs)
+
+        if stage2_model is not None:
+            final_pred = stage2_model(stage1_pred, inputs)
+        else:
+            final_pred = stage1_pred
+
     inputs = inputs.cpu().numpy()
     targets = targets.cpu().numpy()
     stage1_pred = stage1_pred.cpu().numpy()
     final_pred = final_pred.cpu().numpy()
 
-    # ==========================================
-    # Calculate Metrics (in dB to match training logs)
-    # ==========================================
-    rmse_norm = np.sqrt(np.mean((final_pred - targets) ** 2))
-    mae_norm = np.mean(np.abs(final_pred - targets))
-    
-    # Convert to dB
-    rmse_db = rmse_norm * PIXEL_MAX * DB_FACTOR
-    mae_db = mae_norm * PIXEL_MAX * DB_FACTOR
-    
-    # Outage Metrics (Threshold = 0.2 normalized)
-    outage_threshold = 0.2
-    pred_outage = (final_pred < outage_threshold).astype(float)
-    target_outage = (targets < outage_threshold).astype(float)
-    
-    TP = np.sum(pred_outage * target_outage)
-    FN = np.sum((1 - pred_outage) * target_outage)
-    FP = np.sum(pred_outage * (1 - target_outage))
-    
-    recall = TP / (TP + FN + 1e-8)
-    precision = TP / (TP + FP + 1e-8)
-    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+    plt.switch_backend("Agg")
 
-    print("\n" + "="*60)
-    print("OVERALL TEST SET METRICS (4 Random Samples)")
-    print("="*60)
-    print(f"Normalized Scale (0.0 to 1.0):")
-    print(f"  RMSE: {rmse_norm:.4f}")
-    print(f"  MAE : {mae_norm:.4f}")
-    print(f"Decibel Scale (dB) - Matches Training Logs:")
-    print(f"  RMSE: {rmse_db:.2f} dB")
-    print(f"  MAE : {mae_db:.2f} dB")
-    print(f"Outage Detection (Threshold < 0.2):")
-    print(f"  Recall    : {recall:.3f}")
-    print(f"  Precision : {precision:.3f}")
-    print(f"  Outage F1 : {f1:.3f}")
-    print("="*60 + "\n")
+    fig, axes = plt.subplots(n, 6, figsize=(26, 4.2 * n))
+    plt.subplots_adjust(wspace=0.15, hspace=0.25)
 
-    # ==========================================
-    # Visualization
-    # ==========================================
-    fig, axes = plt.subplots(4, 7, figsize=(28, 16))
-    plt.subplots_adjust(wspace=0.1, hspace=0.2)
+    if n == 1:
+        axes = np.expand_dims(axes, axis=0)
 
-    for i in range(4):
-        # 1. Building Mask
-        axes[i, 0].imshow(inputs[i, 0], cmap='gray')
-        axes[i, 0].set_title(f'Sample {i+1}\nBuilding Mask', fontsize=10)
-        axes[i, 0].axis('off')
+    for i in range(n):
+        building = inputs[i, 0]
+        gt = targets[i, 0]
+        s1 = stage1_pred[i, 0]
+        fin = final_pred[i, 0]
 
-        # 2. SDF
-        axes[i, 1].imshow(inputs[i, 2], cmap='viridis')
-        axes[i, 1].set_title('SDF', fontsize=10)
-        axes[i, 1].axis('off')
+        error = np.abs(gt - fin)
 
-        # 3. Ground Truth
-        im_gt = axes[i, 2].imshow(targets[i, 0], cmap='jet', vmin=0, vmax=1)
-        axes[i, 2].set_title('Ground Truth', fontsize=10)
-        axes[i, 2].axis('off')
-        fig.colorbar(im_gt, ax=axes[i, 2], fraction=0.046, pad=0.04)
+        axes[i, 0].imshow(building, cmap="gray")
+        axes[i, 0].set_title("Building Mask", fontsize=10)
+        axes[i, 0].axis("off")
 
-        # 4. Stage 1 Output
-        im_s1 = axes[i, 3].imshow(stage1_pred[i, 0], cmap='jet', vmin=0, vmax=1)
-        axes[i, 3].set_title('Stage 1 (FNO)', fontsize=10)
-        axes[i, 3].axis('off')
-        fig.colorbar(im_s1, ax=axes[i, 3], fraction=0.046, pad=0.04)
+        im1 = axes[i, 1].imshow(gt, cmap="jet", vmin=0.0, vmax=1.0)
+        axes[i, 1].set_title("Ground Truth", fontsize=10)
+        axes[i, 1].axis("off")
+        fig.colorbar(im1, ax=axes[i, 1], fraction=0.046, pad=0.04)
 
-        # 5. Final Output (Stage 1 + Stage 2)
-        im_final = axes[i, 4].imshow(final_pred[i, 0], cmap='jet', vmin=0, vmax=1)
-        axes[i, 4].set_title('Final (FNO + GNO)', fontsize=10)
-        axes[i, 4].axis('off')
-        fig.colorbar(im_final, ax=axes[i, 4], fraction=0.046, pad=0.04)
+        im2 = axes[i, 2].imshow(s1, cmap="jet", vmin=0.0, vmax=1.0)
+        axes[i, 2].set_title("Stage 1", fontsize=10)
+        axes[i, 2].axis("off")
+        fig.colorbar(im2, ax=axes[i, 2], fraction=0.046, pad=0.04)
 
-        # 6. Absolute Error Map
-        error_map = np.abs(targets[i, 0] - final_pred[i, 0])
-        im_err = axes[i, 5].imshow(error_map, cmap='hot', vmin=0, vmax=0.2)
-        axes[i, 5].set_title('Absolute Error', fontsize=10)
-        axes[i, 5].axis('off')
-        fig.colorbar(im_err, ax=axes[i, 5], fraction=0.046, pad=0.04)
-        
-        # 7. Error Map Zoom (Bottom Right Corner example)
-        axes[i, 6].imshow(error_map[180:256, 180:256], cmap='hot', vmin=0, vmax=0.2)
-        axes[i, 6].set_title('Error Zoom\n(Corner)', fontsize=10)
-        axes[i, 6].axis('off')
+        im3 = axes[i, 3].imshow(fin, cmap="jet", vmin=0.0, vmax=1.0)
+        axes[i, 3].set_title("Final Prediction", fontsize=10)
+        axes[i, 3].axis("off")
+        fig.colorbar(im3, ax=axes[i, 3], fraction=0.046, pad=0.04)
 
-    output_image_path = os.path.join(OUTPUT_DIR, 'inference_visualization.png')
-    plt.savefig(output_image_path, dpi=150, bbox_inches='tight')
-    print(f"Visualization saved to: {output_image_path}")
-    plt.show()
+        im4 = axes[i, 4].imshow(error, cmap="hot", vmin=0.0, vmax=0.2)
+        axes[i, 4].set_title("Absolute Error", fontsize=10)
+        axes[i, 4].axis("off")
+        fig.colorbar(im4, ax=axes[i, 4], fraction=0.046, pad=0.04)
+
+        h, w = error.shape
+        crop = min(64, h, w)
+        im5 = axes[i, 5].imshow(error[h - crop:h, w - crop:w], cmap="hot", vmin=0.0, vmax=0.2)
+        axes[i, 5].set_title("Error Zoom", fontsize=10)
+        axes[i, 5].axis("off")
+        fig.colorbar(im5, ax=axes[i, 5], fraction=0.046, pad=0.04)
+
+    plt.savefig(VIS_OUTPUT_PATH, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Visualization saved to: {VIS_OUTPUT_PATH}")
+
+
+def main():
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    device = get_device()
+    print(f"Using device: {device}")
+
+    stage1_model, stage2_model = load_models(device)
+
+    stage1_metrics, final_metrics = evaluate_test(stage1_model, stage2_model, device)
+
+    print("\n" + "=" * 70)
+    print("TEST SET RESULTS")
+    print("=" * 70)
+
+    print("\nStage 1 only:")
+    print(f"  RMSE     : {stage1_metrics['rmse_db']:.3f} dB")
+    print(f"  MAE      : {stage1_metrics['mae_db']:.3f} dB")
+    print(f"  Precision: {stage1_metrics['precision']:.3f}")
+    print(f"  Recall   : {stage1_metrics['recall']:.3f}")
+    print(f"  Outage F1: {stage1_metrics['f1']:.3f}")
+
+    print("\nFinal Stage 1 + Stage 2:")
+    print(f"  RMSE     : {final_metrics['rmse_db']:.3f} dB")
+    print(f"  MAE      : {final_metrics['mae_db']:.3f} dB")
+    print(f"  Precision: {final_metrics['precision']:.3f}")
+    print(f"  Recall   : {final_metrics['recall']:.3f}")
+    print(f"  Outage F1: {final_metrics['f1']:.3f}")
+
+    print("\n" + "=" * 70)
+
+    visualize(stage1_model, stage2_model, device)
+
 
 if __name__ == "__main__":
-    run_inference()
+    main()
