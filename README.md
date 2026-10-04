@@ -1,6 +1,3 @@
-Below is a complete updated `README.md` you can use for the new version of your FYP codebase.
-
-```md
 # Real-Time 2D Radio Environment Mapping using Physics-Unrolled Neural Operators
 
 **Final Year Project (FYP)**  
@@ -980,23 +977,8 @@ The current Version 2.0 pipeline is stable and strong, but there are still possi
 
 This project builds upon and adapts the following research:
 
-1. R. Levie, Ç. Yapar, G. Kutyniok, and G. Caire,  
-   “RadioUNet: Fast radio map estimation with convolutional neural networks,”  
-   *IEEE Transactions on Wireless Communications*, vol. 20, no. 6, pp. 4001–4015, Jun. 2021.
-
-2. J.-H. Lee, O. G. Serbetci, D. Panneer Selvam, and A. F. Molisch,  
-   “PMNet: Robust pathloss map prediction via supervised learning,”  
-   in *Proc. IEEE Global Communications Conference (GLOBECOM)*, Kuala Lumpur, Malaysia, 2023, pp. 4601–4606.
-
-3. Y. Li, Z. Li, Z. Gao, and T. Chen,  
-   “Geo2SigMap: High-fidelity RF signal mapping using geographic databases,”  
-   *arXiv preprint arXiv:2312.14303*, 2023.
-
-4. R. U. Murshed, S. U. Rahman, M. Tang, and E. Soltanaghai,  
-   “Physics-unrolled neural operator for wireless field modeling,”  
-   *arXiv preprint arXiv:2608.18495*, 2026.
-
-5. Z. Li, N. Kovachki, K. Azizzadenesheli, B. Liu, K. Bhattacharya, A. Stuart, and A. Anandkumar,  
-   “Fourier Neural Operator for Parametric Partial Differential Equations,”  
-   *International Conference on Learning Representations (ICLR)*, 2021.
-```
+1.  **PU-HNO:** Murshed et al., *"Physics-Unrolled Neural Operator for Wireless Field Modeling"* (arXiv:2608.18495, 2026).
+2.  **RadioUNet:** Levie et al., *"RadioUNet: Fast Radio Map Estimation with Convolutional Neural Networks"* (IEEE TWC, 2021).
+3.  **GEO2SIGMAP:** Li et al., *"High-Fidelity RF Signal Mapping Using Geographic Databases"* (arXiv:2312.14303, 2024).
+4.  **PMNet:** Lee et al., *"Robust Pathloss Map Prediction via Supervised Learning"* (arXiv:2211.10527, 2023).
+5.  **FNO:** Li et al., *"Fourier Neural Operator for Parametric Partial Differential Equations"* (ICLR, 2021).
