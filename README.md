@@ -441,7 +441,7 @@ The SDF is internally signed, but it is remapped to `[0, 1]` so that it remains 
 ## 8. Project Structure
 
 ```text
-Fgo/
+U_Fno/
 ├── dataset/
 │   ├── RadioMapSeer/
 │   │   ├── png/
@@ -869,84 +869,7 @@ Increase gradually and monitor GPU memory usage.
 
 ---
 
-## 17. Troubleshooting
-
-### Problem: `FileNotFoundError: radiomapseer_multifidelity_train.h5`
-
-Solution:
-
-Run data processing first:
-
-```bash
-python data_process.py
-```
-
-Make sure `DATA_DIR` points to the correct processed folder.
-
----
-
-### Problem: Data processing is very slow
-
-Cause:
-
-Exact LoS generation is CPU-heavy.
-
-Solution:
-
-Let it run in the background.  
-The time required depends strongly on CPU core count.
-
----
-
-### Problem: Training runs out of memory
-
-Solution:
-
-Reduce:
-
-```python
-BASE_CHANNELS
-FNO_MODES
-BATCH_SIZE
-```
-
-Increase:
-
-```python
-ACCUM_STEPS
-```
-
----
-
-### Problem: RMSE improves but outage F1 drops
-
-Solution:
-
-Increase outage/shadow weighting slightly:
-
-```python
-OUTAGE_WEIGHT = 1.0
-SHADOW_WEIGHT = 0.75
-EDGE_WEIGHT = 0.75
-```
-
----
-
-### Problem: Outage F1 improves but RMSE becomes worse
-
-Solution:
-
-Reduce edge/outage weighting:
-
-```python
-OUTAGE_WEIGHT = 0.2
-SHADOW_WEIGHT = 0.2
-EDGE_WEIGHT = 0.2
-```
-
----
-
-## 18. Current Limitations
+## 17. Current Limitations
 
 The current Version 2.0 pipeline is stable and strong, but there are still possible extensions.
 
@@ -973,7 +896,7 @@ The current Version 2.0 pipeline is stable and strong, but there are still possi
 
 ---
 
-## 19. References
+## 18. References
 
 This project builds upon and adapts the following research:
 
