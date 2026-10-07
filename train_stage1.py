@@ -45,7 +45,7 @@ WARMUP_EPOCHS = 5
 NUM_WORKERS = 0
 USE_AMP = False  # Keep False for stable FFT training. Set True only if you test carefully.
 
-RESUME = False
+RESUME = True
 
 # Loss weights.
 L1_WEIGHT = 1.0
